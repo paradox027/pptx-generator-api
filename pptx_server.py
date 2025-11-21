@@ -1,26 +1,22 @@
+# pptx_server.py
 import io
 import os
 import tempfile
 import requests
+import matplotlib.pyplot as plt
+
 from flask import Flask, request, send_file, jsonify
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.chart import XL_CHART_TYPE
-from pptx.chart.data import ChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter
 
 # ---------- CONFIG ----------
-# Path to your uploaded PPTX (developer-provided asset). We'll use it as optional template / source for logo.
 TEMPLATE_PPTX_PATH = "/mnt/data/ACCINZIA (1).pptx"
-
-# Font to use for title / body. Install on host for best results.
-FONT_NAME = os.environ.get("FONT_NAME", "Calibri")  # change to "Inter", "Montserrat", etc. if installed
+FONT_NAME = os.environ.get("FONT_NAME", "Calibri")
 TITLE_FONT_SIZE = 36
 BODY_FONT_SIZE = 14
 
-# Default theme mapping (simple)
 THEME_MAP = {
     "tech": ("#1F4E79", "#6FA8DC"),
     "food": ("#2E7D32", "#A5D6A7"),
@@ -29,6 +25,11 @@ THEME_MAP = {
     "health": ("#EF6C00", "#FFCC80"),
     "default": ("#3E3E3E", "#BDBDBD"),
 }
+
+# Matplotlib config for polished charts
+plt.rcParams["font.size"] = 12
+plt.rcParams["savefig.transparent"] = True
+plt.rcParams["axes.facecolor"] = "none"
 
 app = Flask(__name__)
 
@@ -52,36 +53,42 @@ def pick_theme(company_name, business_type):
     return THEME_MAP["default"]
 
 def make_gradient_image(color_from, color_to, size=(1280, 720), vertical=True, blur=True):
-    """Create a gradient image (Pillow) and return bytes."""
     img = Image.new("RGB", size, color_from)
     draw = ImageDraw.Draw(img)
-    for i in range(size[1] if vertical else size[0]):
-        ratio = i / float(size[1] - 1) if vertical else i / float(size[0] - 1)
+    w, h = size
+    steps = h if vertical else w
+    for i in range(steps):
+        ratio = i / float(steps - 1) if steps > 1 else 0
         r = int(color_from[0] + (color_to[0] - color_from[0]) * ratio)
         g = int(color_from[1] + (color_to[1] - color_from[1]) * ratio)
         b = int(color_from[2] + (color_to[2] - color_from[2]) * ratio)
         if vertical:
-            draw.line([(0, i), (size[0], i)], fill=(r, g, b))
+            draw.line([(0, i), (w, i)], fill=(r, g, b))
         else:
-            draw.line([(i, 0), (i, size[1])], fill=(r, g, b))
+            draw.line([(i, 0), (i, h)], fill=(r, g, b))
     if blur:
-        img = img.filter(ImageFilter.GaussianBlur(radius=8))
+        img = img.filter(ImageFilter.GaussianBlur(radius=6))
     bio = io.BytesIO()
     img.save(bio, format="PNG")
     bio.seek(0)
     return bio
 
-def set_slide_background_image(slide, img_bytes):
-    """Set an image as slide background - python-pptx technique: add full-screen picture as z-order background."""
-    pic = slide.shapes.add_picture(img_bytes, Inches(0), Inches(0), width=slide.part.slide_width, height=slide.part.slide_height)
-    # Optionally send to back - python-pptx doesn't have z-order send_to_back API, but adding first usually works.
+def set_slide_background_image(slide, img_bytes, prs):
+    # Use presentation dimensions (correct API)
+    slide.shapes.add_picture(
+        img_bytes,
+        Inches(0),
+        Inches(0),
+        width=prs.slide_width,
+        height=prs.slide_height
+    )
 
 def fetch_image_bytes(url):
     try:
         r = requests.get(url, timeout=8)
         r.raise_for_status()
         return io.BytesIO(r.content)
-    except Exception as e:
+    except Exception:
         return None
 
 def safe_text(value):
@@ -90,6 +97,38 @@ def safe_text(value):
     if isinstance(value, list):
         return "\n".join([str(x) for x in value])
     return str(value)
+
+# ---------- Matplotlib chart helpers ----------
+def make_premium_pie_chart(categories, values, colors=None, dpi=160, figsize=(5,5)):
+    if not categories or not values:
+        categories = ["N/A"]
+        values = [1]
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    palette = colors or plt.cm.tab20.colors
+    # ensure enough colors
+    slice_colors = [palette[i % len(palette)] for i in range(len(values))]
+    wedges, texts, autotexts = ax.pie(
+        values,
+        labels=categories,
+        autopct="%1.1f%%",
+        startangle=140,
+        wedgeprops={"linewidth": 1, "edgecolor": "white"},
+        colors=slice_colors,
+        pctdistance=0.75,
+    )
+    # donut
+    centre = plt.Circle((0, 0), 0.40, fc="white")
+    ax.add_artist(centre)
+    ax.axis("equal")
+    # style autotexts
+    for t in autotexts:
+        t.set_color("black")
+        t.set_fontsize(10)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", transparent=True, bbox_inches="tight", pad_inches=0.1)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
 
 # ---------- PPTX ASSEMBLY ----------
 @app.route("/generate", methods=["POST"])
@@ -100,73 +139,70 @@ def generate():
 
     company = payload.get("company_name", "Company")
     business_type = payload.get("nature_of_business", "")
-    theme_from, theme_to = pick_theme(company, business_type)
-    color_from = hex_to_rgb(theme_from)
-    color_to = hex_to_rgb(theme_to)
-    font_title = FONT_NAME
-    font_body = FONT_NAME
+    theme_from_hex, theme_to_hex = pick_theme(company, business_type)
+    color_from = hex_to_rgb(theme_from_hex)
+    color_to = hex_to_rgb(theme_to_hex)
 
     prs = Presentation()
 
-    # create gradient image once for slides; we will vary slightly per slide to create unique themes
-    base_gradient = make_gradient_image(color_from, color_to, size=(1280, 720), vertical=True, blur=True)
-
-    # OPTIONAL: try to extract logo from provided logo_url or from template PPTX asset
+    # try to fetch a logo from payload.logo_url or from TEMPLATE_PPTX_PATH
     logo_img_bytes = None
     if payload.get("logo_url"):
         logo_img_bytes = fetch_image_bytes(payload["logo_url"])
 
-    # attempt to extract first image from your TEMPLATE_PPTX_PATH if no logo was found
     if not logo_img_bytes and os.path.exists(TEMPLATE_PPTX_PATH):
         try:
             tpl = Presentation(TEMPLATE_PPTX_PATH)
             for s in tpl.slides:
                 for shp in s.shapes:
-                    if shp.shape_type == 13 and hasattr(shp, "image"):  # picture
-                        img = shp.image
-                        logo_img_bytes = io.BytesIO(img.blob)
+                    # picture shape
+                    if hasattr(shp, "image") and shp.image is not None:
+                        logo_img_bytes = io.BytesIO(shp.image.blob)
+                        logo_img_bytes.seek(0)
                         break
                 if logo_img_bytes:
                     break
         except Exception:
             logo_img_bytes = None
 
-    # ---------------------------------
-    # Slide builder helper
-    # ---------------------------------
-    def add_styled_slide(title_text, body_lines=None, slide_index=0, use_gradient=True, chart=None):
-        # choose gradient variant per slide index to vary themes
-        grad = make_gradient_image(
-            tuple(int((color_from[i] + (color_to[i] - color_from[i]) * (slide_index/12))) for i in range(3)),
-            tuple(int((color_from[i] + (color_to[i] - color_from[i]) * ((slide_index+1)/12))) for i in range(3)),
-            size=(1280, 720), vertical=True, blur=True
-        )
-        slide = prs.slides.add_slide(prs.slide_layouts[6])  # use blank layout for full control
-        set_slide_background_image(slide, grad)
+    # helper to add a styled slide
+    def add_styled_slide(title_text, body_lines=None, slide_index=0, chart=None):
+        # build a subtle variant gradient per slide index
+        start = tuple(int(color_from[i] + (color_to[i] - color_from[i]) * (slide_index / 12)) for i in range(3))
+        end = tuple(int(color_from[i] + (color_to[i] - color_from[i]) * ((slide_index + 1) / 12)) for i in range(3))
+        grad_img = make_gradient_image(start, end, size=(1280, 720), vertical=True, blur=True)
 
-        # Title box
+        slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank layout
+        set_slide_background_image(slide, grad_img, prs)
+
+        # Title
         left, top, width, height = Inches(0.5), Inches(0.3), Inches(9), Inches(1)
         title_box = slide.shapes.add_textbox(left, top, width, height)
         title_tf = title_box.text_frame
-        title_tf.text = title_text
-        title_p = title_tf.paragraphs[0]
-        title_p.font.size = Pt(TITLE_FONT_SIZE)
-        title_p.font.bold = True
-        title_p.font.name = font_title
-        title_p.font.color.rgb = RGBColor(255, 255, 255)
+        title_tf.margin_top = 0
+        title_tf.margin_bottom = 0
+        title_tf.text = title_text or ""
+        p0 = title_tf.paragraphs[0]
+        p0.font.size = Pt(TITLE_FONT_SIZE)
+        p0.font.bold = True
+        p0.font.name = FONT_NAME
+        p0.font.color.rgb = RGBColor(255, 255, 255)
 
-        # Insert logo at top-right
+        # logo top-right if exists
         if logo_img_bytes:
             try:
-                slide.shapes.add_picture(logo_img_bytes, prs.slide_width - Inches(2.2), Inches(0.2), width=Inches(2))
-                # reset stream position for reuse
+                # we need to copy bytes because add_picture will consume the stream
+                logo_img_bytes.seek(0)
+                logo_data = io.BytesIO(logo_img_bytes.read())
+                logo_data.seek(0)
+                slide.shapes.add_picture(logo_data, prs.slide_width - Inches(2.2), Inches(0.2), width=Inches(2))
                 logo_img_bytes.seek(0)
             except Exception:
                 pass
 
         # Body
         if body_lines:
-            left, top, width, height = Inches(0.5), Inches(1.6), Inches(9), Inches(4.5)
+            left, top, width, height = Inches(0.5), Inches(1.5), Inches(9), Inches(4.5)
             tb = slide.shapes.add_textbox(left, top, width, height)
             tf = tb.text_frame
             tf.word_wrap = True
@@ -179,77 +215,72 @@ def generate():
                     p.text = line
                 p.level = 0
                 p.font.size = Pt(BODY_FONT_SIZE)
-                p.font.name = font_body
+                p.font.name = FONT_NAME
                 p.font.color.rgb = RGBColor(255, 255, 255)
-        # Chart (optional)
+
+        # Chart: if chart dict provided, create matplotlib image and insert
         if chart:
-            # chart must be a dict: {"type":"pie" or "bar", "categories": [...], "values":[...]}
             try:
-                chart_data = ChartData()
-                chart_data.categories = chart.get("categories", [])
-                chart_data.add_series("Series 1", chart.get("values", []))
-                left_c, top_c, w_c, h_c = Inches(6.5), Inches(2), Inches(3.5), Inches(3)
-                if chart.get("type") == "pie":
-                    slide.shapes.add_chart(XL_CHART_TYPE.PIE, left_c, top_c, w_c, h_c, chart_data)
+                ctype = chart.get("type", "pie")
+                categories = chart.get("categories", [])
+                values = chart.get("values", [])
+                # choose palette derived from theme
+                palette = [tuple(x/255 for x in hex_to_rgb(theme_from_hex)), tuple(x/255 for x in hex_to_rgb(theme_to_hex))]
+                # fallback: use theme hex strings for matplotlib (strings accepted)
+                mpl_colors = [theme_from_hex, theme_to_hex, "#8888FF", "#66CC99", "#FFAA44"]
+                chart_img = None
+                if ctype in ("pie", "donut"):
+                    chart_img = make_premium_pie_chart(categories, values, colors=mpl_colors)
                 else:
-                    slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, left_c, top_c, w_c, h_c, chart_data)
+                    # fallback simple pie for unsupported types in this helper
+                    chart_img = make_premium_pie_chart(categories, values, colors=mpl_colors)
+                if chart_img:
+                    # insert picture centered-ish
+                    slide.shapes.add_picture(chart_img, Inches(1.5), Inches(1.6), width=Inches(6))
             except Exception as e:
-                print("chart error", e)
+                print("chart render error:", e)
 
         return slide
 
-    # ---------------------------------
     # Build slides (12)
-    # ---------------------------------
-    # Slide 1: Company hero
     hero_lines = [safe_text(payload.get("tagline") or payload.get("company_name")), safe_text(payload.get("nature_of_business"))]
     add_styled_slide(payload.get("company_name", "Company"), body_lines=hero_lines, slide_index=0)
 
-    # Slide 2: Nature of business / Overview
     overview = [safe_text(payload.get("nature_of_business", "")), safe_text(payload.get("short_description", ""))]
     add_styled_slide("Nature of Business", body_lines=overview, slide_index=1)
 
-    # Slide 3: Vision + Mission
     vm_lines = [f"Vision: {safe_text(payload.get('vision',''))}", f"Mission: {safe_text(payload.get('mission',''))}"]
     add_styled_slide("Vision & Mission", body_lines=vm_lines, slide_index=2)
 
-    # Slide 4: Problems
     problems = [f"• {p}" for p in payload.get("consumer_problems", [])] or ["No specific problems provided."]
     add_styled_slide("Problems Faced by Consumers", body_lines=problems, slide_index=3)
 
-    # Slide 5: Solutions
     solutions = [f"• {s}" for s in payload.get("solutions_provided", [])] or ["No solutions provided."]
     add_styled_slide("Solutions Provided", body_lines=solutions, slide_index=4)
 
-    # Slide 6: Products / Services
     prods = [f"• {p}" for p in payload.get("products_services", [])] or ["No products/services listed."]
     add_styled_slide("Products & Services", body_lines=prods, slide_index=5)
 
-    # Slide 7: Market share (pie)
+    # Market share: accept list of {segment,percent} or dict
     market = payload.get("market_share", [])
     if isinstance(market, dict):
-        # accept either dict or list
         market_items = [{"segment": k, "percent": v} for k, v in market.items()]
     else:
-        market_items = market
-    categories = [m.get("segment","") for m in market_items] if market_items else ["N/A"]
-    values = [float(m.get("percent",0)) for m in market_items] if market_items else [100]
+        market_items = market or []
+    categories = [m.get("segment", "") for m in market_items] if market_items else ["N/A"]
+    values = [float(m.get("percent", 0)) for m in market_items] if market_items else [100]
     add_styled_slide("Market Share", body_lines=[f"Total market coverage: {sum(values)}%"], slide_index=6,
-                     chart={"type":"pie", "categories":categories, "values":values})
+                     chart={"type": "pie", "categories": categories, "values": values})
 
-    # Slide 8: Target Market
-    target_lines = [f"• {t}" for t in payload.get("target_market", [])] or [payload.get("target_market","Not specified")]
+    target_lines = [f"• {t}" for t in payload.get("target_market", [])] or [payload.get("target_market", "Not specified")]
     add_styled_slide("Target Market", body_lines=target_lines, slide_index=7)
 
-    # Slide 9: USP
-    usp_lines = [f"• {u}" for u in (payload.get("usp") or [])] or [payload.get("usp","Not specified")]
+    usp_lines = [f"• {u}" for u in (payload.get("usp") or [])] or [payload.get("usp", "Not specified")]
     add_styled_slide("Unique Selling Proposition (USP)", body_lines=usp_lines, slide_index=8)
 
-    # Slide 10: Contact Details
     contact = payload.get("company_contact", payload.get("contact_details", "N/A"))
     add_styled_slide("Contact Details", body_lines=[safe_text(contact)], slide_index=9)
 
-    # Slide 11: Directors
     directors = payload.get("directors", [])
     if not directors and isinstance(payload.get("director_name"), str):
         directors = [{
@@ -264,10 +295,8 @@ def generate():
         dir_lines.append(line)
     add_styled_slide("Directors", body_lines=dir_lines or ["No director data provided."], slide_index=10)
 
-    # Slide 12: Fund Deployment (pie)
     fund = payload.get("fund_deployment", {})
     if not fund:
-        # fallback to individual keys
         fund = {
             "testing_manufacturing": float(payload.get("fund_deployment_testing", 0)),
             "man_power": float(payload.get("fund_deployment_manpower", 0)),
@@ -281,15 +310,16 @@ def generate():
     categories_fd = list(fund.keys()) if fund else ["N/A"]
     values_fd = [float(v) for v in fund.values()] if fund else [100]
     add_styled_slide("Fund Deployment", body_lines=[f"Total: {sum(values_fd)}%"], slide_index=11,
-                     chart={"type":"pie","categories":categories_fd,"values":values_fd})
+                     chart={"type": "pie", "categories": categories_fd, "values": values_fd})
 
-    # Save to temporary file and return
+    # Save and return
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pptx")
     prs.save(tmp.name)
     tmp.flush()
     tmp.seek(0)
-
     return send_file(tmp.name, as_attachment=True, download_name=f"{company}_pitchdeck.pptx")
 
+
 if __name__ == "__main__":
+    # Production: gunicorn is used; this is for local testing
     app.run(host="0.0.0.0", port=5001)
