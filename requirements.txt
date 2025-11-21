@@ -1,5 +1,8 @@
+gunicorn
 flask
 python-pptx
 Pillow
 requests
 matplotlib
+
+
